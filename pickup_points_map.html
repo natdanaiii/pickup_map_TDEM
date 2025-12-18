@@ -15,6 +15,7 @@
   <style>
     html, body { height: 100%; margin: 0; }
     #map { height: 100%; }
+    .leaflet-control-layers { max-height: 60vh; overflow: auto; }
   </style>
 </head>
 
@@ -22,16 +23,42 @@
 <div id="map"></div>
 
 <script>
-  // ✅ Put your CSV filename here (exactly as in the repo)
-  // Tip: keeping an English filename is easier, but Thai also works.
-  const CSV_FILE = "./pickup_points_TDEM_3.csv";
+  // =========================
+  // CONFIG
+  // =========================
+  const CSV_NAME = "pickup_points_TDEM_3.csv";
 
-  // ---- helpers to find columns even if headers change ----
+  // Option A: Load from same GitHub Pages folder (recommended)
+  // This builds a correct URL no matter if you open with / or without /
+  const pageUrl = window.location.href;
+  const baseUrl = pageUrl.endsWith("/")
+    ? pageUrl
+    : (pageUrl.substring(0, pageUrl.lastIndexOf("/") + 1)); // folder of current page
+  const CSV_FILE = new URL(CSV_NAME, baseUrl).toString();
+
+  // Option B (fallback): GitHub raw (uncomment to force use raw)
+  // const CSV_FILE = "https://raw.githubusercontent.com/natdanaiii/pickup_map_TDEM/main/pickup_points_TDEM_3.csv";
+
+  // =========================
+  // HELPERS
+  // =========================
+  function norm(s) {
+    return (s ?? "").toString().trim().toLowerCase();
+  }
+
+  // Find a header by trying multiple candidate names
   function pickKey(headers, candidates) {
-    const h = headers.map(x => (x || "").toString().trim().toLowerCase());
+    const h = headers.map(x => norm(x));
     for (const c of candidates) {
-      const idx = h.indexOf(c.toLowerCase());
+      const idx = h.indexOf(norm(c));
       if (idx >= 0) return headers[idx];
+    }
+    // also try "contains" match (for headers like "Estimate Time (Optional)")
+    for (const c of candidates) {
+      const cc = norm(c);
+      for (let i = 0; i < h.length; i++) {
+        if (h[i].includes(cc)) return headers[i];
+      }
     }
     return null;
   }
@@ -41,37 +68,48 @@
     return Number.isFinite(n) ? n : null;
   }
 
+  // =========================
+  // MAP SETUP
+  // =========================
   const map = L.map("map", { zoomControl: true }).setView([13.75, 100.55], 10);
+
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     maxZoom: 19,
     attribution: "&copy; OpenStreetMap"
   }).addTo(map);
 
-  fetch(CSV_FILE)
+  // =========================
+  // LOAD + DRAW
+  // =========================
+  fetch(CSV_FILE, { cache: "no-store" })
     .then(r => {
-      if (!r.ok) throw new Error("Cannot load CSV: " + r.status + " " + r.statusText);
+      if (!r.ok) throw new Error("Cannot load CSV: " + r.status + " " + r.statusText + "\nURL: " + CSV_FILE);
       return r.text();
     })
     .then(text => {
-      const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
-      const rows = parsed.data;
-      const headers = parsed.meta.fields || [];
+      const parsed = Papa.parse(text, {
+        header: true,
+        skipEmptyLines: true
+      });
 
-      // Try to auto-detect columns (edit candidates if needed)
-      const kLat  = pickKey(headers, ["lat", "latitude", "Lat", "Latitude"]);
-      const kLon  = pickKey(headers, ["lon", "lng", "longitude", "Lon", "Longitude", "Long"]);
-      const kRoute = pickKey(headers, ["route", "Route"]);
-      const kTime  = pickKey(headers, ["estimate time", "estimate_time", "time", "Time", "Estimated Time", "Estimate Time (Optional)"]);
-      const kPickup = pickKey(headers, ["pick up point", "pickup point", "pickup_point", "Pick up point", "Pick up Point"]);
+      const rows = parsed.data || [];
+      const headers = parsed.meta?.fields || [];
+
+      // ---- auto-detect your columns (edit candidates if your headers differ) ----
+      const kLat   = pickKey(headers, ["lat", "latitude"]);
+      const kLon   = pickKey(headers, ["lon", "lng", "longitude"]);
+      const kRoute = pickKey(headers, ["route"]);
+      const kTime  = pickKey(headers, ["estimate time", "time"]);
+      const kPickup = pickKey(headers, ["pick up point", "pickup point", "pickup_point"]);
 
       if (!kLat || !kLon) {
-        console.log("Headers:", headers);
-        throw new Error("Cannot find lat/lon columns. Check your CSV headers in console.");
+        console.log("CSV headers:", headers);
+        throw new Error("Cannot find lat/lon columns. Open DevTools Console to see headers.");
       }
 
-      // Group markers by route for toggling
+      // Group markers by route so you can toggle routes
       const routeLayers = {};
-      let firstValid = null;
+      const allLatLng = [];
 
       rows.forEach(row => {
         const lat = toNum(row[kLat]);
@@ -82,7 +120,9 @@
         const time  = (kTime ? (row[kTime] ?? "") : "").toString().trim() || "-";
         const pickup = (kPickup ? (row[kPickup] ?? "") : "").toString().trim() || "-";
 
-        if (!routeLayers[route]) routeLayers[route] = L.layerGroup().addTo(map);
+        if (!routeLayers[route]) {
+          routeLayers[route] = L.layerGroup().addTo(map);
+        }
 
         const popupHtml = `
           <b>Route:</b> ${route}<br>
@@ -90,22 +130,25 @@
           <b>Pickup:</b> ${pickup}
         `;
 
-        L.circleMarker([lat, lon], { radius: 5, weight: 2, fillOpacity: 0.8 })
-          .bindPopup(popupHtml)
-          .addTo(routeLayers[route]);
+        const marker = L.circleMarker([lat, lon], {
+          radius: 5,
+          weight: 2,
+          fillOpacity: 0.8
+        }).bindPopup(popupHtml);
 
-        if (!firstValid) firstValid = [lat, lon];
+        marker.addTo(routeLayers[route]);
+        allLatLng.push([lat, lon]);
       });
 
-      // Layer control
+      // Add route toggle control
       L.control.layers(null, routeLayers, { collapsed: false }).addTo(map);
 
-      // Fit bounds
-      const all = [];
-      Object.values(routeLayers).forEach(g => g.eachLayer(m => all.push(m.getLatLng())));
-      if (all.length) map.fitBounds(L.latLngBounds(all).pad(0.15));
-      else if (firstValid) map.setView(firstValid, 12);
-      else alert("No valid lat/lon rows found in CSV.");
+      // Zoom to all points
+      if (allLatLng.length) {
+        map.fitBounds(allLatLng, { padding: [30, 30] });
+      } else {
+        alert("No valid lat/lon rows found in the CSV.");
+      }
     })
     .catch(err => {
       console.error(err);
