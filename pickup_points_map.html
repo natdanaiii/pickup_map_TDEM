@@ -9,7 +9,7 @@
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
-  <!-- PapaParse (CSV parser) -->
+  <!-- PapaParse -->
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 
   <style>
@@ -24,40 +24,45 @@
 
 <script>
   // =========================
-  // CONFIG
+  // CONFIG (your CSV filename in the repo)
   // =========================
   const CSV_NAME = "pickup_points_TDEM_3.csv";
 
-  // Option A: Load from same GitHub Pages folder (recommended)
-  // This builds a correct URL no matter if you open with / or without /
+  // Build a safe URL to the CSV in the same folder as this HTML file
+  // (Works even if the page URL has or doesn't have a trailing slash)
   const pageUrl = window.location.href;
-  const baseUrl = pageUrl.endsWith("/")
-    ? pageUrl
-    : (pageUrl.substring(0, pageUrl.lastIndexOf("/") + 1)); // folder of current page
-  const CSV_FILE = new URL(CSV_NAME, baseUrl).toString();
+  const folderUrl = pageUrl.substring(0, pageUrl.lastIndexOf("/") + 1);
+  const CSV_FILE = new URL(CSV_NAME, folderUrl).toString();
 
-  // Option B (fallback): GitHub raw (uncomment to force use raw)
+  // If you ever want to force GitHub RAW instead, use this line:
   // const CSV_FILE = "https://raw.githubusercontent.com/natdanaiii/pickup_map_TDEM/main/pickup_points_TDEM_3.csv";
 
   // =========================
   // HELPERS
   // =========================
-  function norm(s) {
-    return (s ?? "").toString().trim().toLowerCase();
+  function cleanHeader(s) {
+    return (s ?? "")
+      .toString()
+      .replace(/\uFEFF/g, "")   // BOM
+      .replace(/\u00A0/g, " ")  // NBSP
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
   }
 
-  // Find a header by trying multiple candidate names
   function pickKey(headers, candidates) {
-    const h = headers.map(x => norm(x));
+    const cleaned = headers.map(h => cleanHeader(h));
+
+    // exact match
     for (const c of candidates) {
-      const idx = h.indexOf(norm(c));
+      const idx = cleaned.indexOf(cleanHeader(c));
       if (idx >= 0) return headers[idx];
     }
-    // also try "contains" match (for headers like "Estimate Time (Optional)")
+    // contains match
     for (const c of candidates) {
-      const cc = norm(c);
-      for (let i = 0; i < h.length; i++) {
-        if (h[i].includes(cc)) return headers[i];
+      const cc = cleanHeader(c);
+      for (let i = 0; i < cleaned.length; i++) {
+        if (cleaned[i].includes(cc)) return headers[i];
       }
     }
     return null;
@@ -68,18 +73,52 @@
     return Number.isFinite(n) ? n : null;
   }
 
+  // If headers are weird, infer lat/lon by value ranges (Thailand-friendly)
+  function inferLatLon(headers, rows) {
+    const stats = headers.map(h => ({
+      key: h,
+      latScore: 0,
+      lonScore: 0
+    }));
+
+    const sample = rows.slice(0, Math.min(rows.length, 200)); // scan first 200 rows
+
+    for (const row of sample) {
+      headers.forEach((h, i) => {
+        const v = toNum(row[h]);
+        if (v === null) return;
+
+        // latitude around Thailand (5..25)
+        if (v >= 5 && v <= 25) stats[i].latScore += 1;
+
+        // longitude around Thailand (90..110)
+        if (v >= 90 && v <= 110) stats[i].lonScore += 1;
+      });
+    }
+
+    const latBest = [...stats].sort((a,b) => b.latScore - a.latScore)[0];
+    const lonBest = [...stats].sort((a,b) => b.lonScore - a.lonScore)[0];
+
+    if (!latBest || !lonBest) return { kLat: null, kLon: null };
+
+    // must be different columns and have some evidence
+    if (latBest.key === lonBest.key) return { kLat: null, kLon: null };
+    if (latBest.latScore < 3 || lonBest.lonScore < 3) return { kLat: null, kLon: null };
+
+    return { kLat: latBest.key, kLon: lonBest.key };
+  }
+
   // =========================
-  // MAP SETUP
+  // MAP
   // =========================
   const map = L.map("map", { zoomControl: true }).setView([13.75, 100.55], 10);
-
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     maxZoom: 19,
     attribution: "&copy; OpenStreetMap"
   }).addTo(map);
 
   // =========================
-  // LOAD + DRAW
+  // LOAD CSV
   // =========================
   fetch(CSV_FILE, { cache: "no-store" })
     .then(r => {
@@ -89,25 +128,44 @@
     .then(text => {
       const parsed = Papa.parse(text, {
         header: true,
-        skipEmptyLines: true
+        skipEmptyLines: true,
+        dynamicTyping: false
       });
 
       const rows = parsed.data || [];
       const headers = parsed.meta?.fields || [];
 
-      // ---- auto-detect your columns (edit candidates if your headers differ) ----
-      const kLat   = pickKey(headers, ["lat", "latitude"]);
-      const kLon   = pickKey(headers, ["lon", "lng", "longitude"]);
-      const kRoute = pickKey(headers, ["route"]);
-      const kTime  = pickKey(headers, ["estimate time", "time"]);
-      const kPickup = pickKey(headers, ["pick up point", "pickup point", "pickup_point"]);
-
-      if (!kLat || !kLon) {
-        console.log("CSV headers:", headers);
-        throw new Error("Cannot find lat/lon columns. Open DevTools Console to see headers.");
+      if (!headers.length) {
+        throw new Error("CSV has no headers. Please re-export with header row.");
       }
 
-      // Group markers by route so you can toggle routes
+      // 1) Try header-based detection (many names + Thai)
+      let kLat = pickKey(headers, ["lat", "latitude", "ละติจูด", "พิกัดละติจูด"]);
+      let kLon = pickKey(headers, ["lon", "lng", "longitude", "ลองจิจูด", "พิกัดลองจิจูด"]);
+
+      // 2) If not found, infer from value ranges
+      if (!kLat || !kLon) {
+        const inferred = inferLatLon(headers, rows);
+        kLat = kLat || inferred.kLat;
+        kLon = kLon || inferred.kLon;
+      }
+
+      // Other columns (optional)
+      const kRoute = pickKey(headers, ["route", "สาย", "เส้นทาง"]);
+      const kTime  = pickKey(headers, ["estimate time", "time", "เวลา", "เวลาประมาณ"]);
+      const kPickup = pickKey(headers, ["pick up point", "pickup point", "pickup_point", "จุดรับ", "จุดขึ้น"]);
+
+      if (!kLat || !kLon) {
+        console.log("CSV headers detected:", headers);
+        alert(
+          "Cannot find lat/lon columns.\n\n" +
+          "Open DevTools Console (F12) and check 'CSV headers detected'.\n\n" +
+          "Tip: Rename your columns to 'lat' and 'lon' OR tell me your header names."
+        );
+        return;
+      }
+
+      // Group markers by route
       const routeLayers = {};
       const allLatLng = [];
 
@@ -120,34 +178,28 @@
         const time  = (kTime ? (row[kTime] ?? "") : "").toString().trim() || "-";
         const pickup = (kPickup ? (row[kPickup] ?? "") : "").toString().trim() || "-";
 
-        if (!routeLayers[route]) {
-          routeLayers[route] = L.layerGroup().addTo(map);
-        }
+        if (!routeLayers[route]) routeLayers[route] = L.layerGroup().addTo(map);
 
         const popupHtml = `
           <b>Route:</b> ${route}<br>
           <b>Time:</b> ${time}<br>
-          <b>Pickup:</b> ${pickup}
+          <b>Pickup:</b> ${pickup}<br>
+          <b>Lat/Lon:</b> ${lat}, ${lon}
         `;
 
-        const marker = L.circleMarker([lat, lon], {
-          radius: 5,
-          weight: 2,
-          fillOpacity: 0.8
-        }).bindPopup(popupHtml);
+        L.circleMarker([lat, lon], { radius: 5, weight: 2, fillOpacity: 0.8 })
+          .bindPopup(popupHtml)
+          .addTo(routeLayers[route]);
 
-        marker.addTo(routeLayers[route]);
         allLatLng.push([lat, lon]);
       });
 
-      // Add route toggle control
       L.control.layers(null, routeLayers, { collapsed: false }).addTo(map);
 
-      // Zoom to all points
       if (allLatLng.length) {
         map.fitBounds(allLatLng, { padding: [30, 30] });
       } else {
-        alert("No valid lat/lon rows found in the CSV.");
+        alert("No valid lat/lon rows found (lat/lon columns exist but values may be empty).");
       }
     })
     .catch(err => {
